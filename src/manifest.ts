@@ -7,6 +7,9 @@ export default defineManifest({
   version: pkg.version,
   description: '小红书/红书 内容采集',
   permissions: ['sidePanel', 'tabs', 'storage', 'scripting', 'cookies', 'browsingData', 'alarms'],
+  // 注：chrome.system.network.getNetworkInterfaces 是 ChromeOS 专属（Apps API），
+  // 桌面 Chrome (Win/Mac/Linux) 拿不到。所以这里不再申请 system.network 权限，
+  // 桌面侧改用 WebRTC ICE candidate 探内网 IP + 用户手填字段兜底。
   host_permissions: [
     'https://www.xiaohongshu.com/*',
     'https://www.rednote.com/*',

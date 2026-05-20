@@ -159,6 +159,34 @@ export const STORAGE_KEYS = {
   allowedTimeRanges: 'allowedTimeRanges',
   /** 上次执行「日历日临时数据清理」的日期 YYYY-MM-DD；与当日相同时跳过 */
   autoTaskLastDailyPruneDate: 'autoTaskLastDailyPruneDate',
+  // ---------- 节点身份 / 环境信息（100 节点集中管控 · 第一类指标） ----------
+  /** 本机唯一 ID：首次启动时随机生成的 UUID，所有上报都带上 */
+  nodeId: 'nodeId',
+  /** 用户手工配置的节点别名（机器名 / 业务标签） */
+  nodeAlias: 'nodeAlias',
+  /** 本节点首次跑起来的时间戳（仅写一次） */
+  nodeFirstSeenAt: 'nodeFirstSeenAt',
+  /**
+   * 浏览器最近一次启动的时间戳（不含 SW 单纯被回收重启）：
+   * - chrome.runtime.onStartup 触发时写一次
+   * - chrome.runtime.onInstalled 触发时写一次
+   * - 首次 background 启动且 storage 中无值时也写一次（兜底）
+   */
+  nodeStartupAt: 'nodeStartupAt',
+  /**
+   * 出口 IP / 地区 缓存：{ ip, city, region, country, org, at, ok, error? }
+   * - 由 panel / background 定期通过 https://ipinfo.io/json 获取
+   * - 失败也写一份带 ok:false 的记录，UI 据此显示错误
+   */
+  outboundIpCache: 'outboundIpCache',
+  /**
+   * 用户手填的内网 IPv4（用于群控里「找到这台机器」）。
+   * 桌面 Chrome 扩展拿不到本机网卡，因此最终的权威值来自这里。
+   * WebRTC 自动探测仅作为「建议值」展示，不直接写入此 key。
+   */
+  nodeLanIpV4: 'nodeLanIpV4',
+  /** 用户手填的主机名 / 物理位置（如「办公室-3层-13工位」「机房 A-Rack4-U7」） */
+  nodeHostname: 'nodeHostname',
 } as const;
 
 // ---------- STORAGE_KEYS 分组（纯文档/心智标签，不改变存储位置） ----------
@@ -200,6 +228,12 @@ export const PERSIST_KEYS = {
   allowedTimeEnd: STORAGE_KEYS.allowedTimeEnd,
   allowedTimeRanges: STORAGE_KEYS.allowedTimeRanges,
   autoTaskLastDailyPruneDate: STORAGE_KEYS.autoTaskLastDailyPruneDate,
+  // ---------- 节点身份 / 环境信息 ----------
+  nodeId: STORAGE_KEYS.nodeId,
+  nodeAlias: STORAGE_KEYS.nodeAlias,
+  nodeFirstSeenAt: STORAGE_KEYS.nodeFirstSeenAt,
+  nodeLanIpV4: STORAGE_KEYS.nodeLanIpV4,
+  nodeHostname: STORAGE_KEYS.nodeHostname,
 } as const;
 
 /** 运行时状态：多进程协调，浏览器重启后需要"恢复到继续运行"的语义 */
@@ -215,6 +249,8 @@ export const RUNTIME_KEYS = {
   autoTaskResumeState: STORAGE_KEYS.autoTaskResumeState,
   countdownRemainSec: STORAGE_KEYS.countdownRemainSec,
   autoTaskSessionStartAt: STORAGE_KEYS.autoTaskSessionStartAt,
+  /** 浏览器最近一次启动时间，用于「已运行时长」计算 */
+  nodeStartupAt: STORAGE_KEYS.nodeStartupAt,
 } as const;
 
 /** 瞬态：采集中间结果 / 最后日志行 / 回调状态；丢失可容忍 */
@@ -227,6 +263,8 @@ export const TRANSIENT_KEYS = {
   creatorListPages: STORAGE_KEYS.creatorListPages,
   creatorListResult: STORAGE_KEYS.creatorListResult,
   apiLastProbe: STORAGE_KEYS.apiLastProbe,
+  /** 出口 IP 缓存：受外网请求和 ipinfo 限速影响；丢失只是下次重新拉一遍 */
+  outboundIpCache: STORAGE_KEYS.outboundIpCache,
 } as const;
 
 // chrome.alarms 名称

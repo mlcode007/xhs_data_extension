@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, watch, onMounted } from 'vue';
-import { sessionStore } from '@shared/storage';
+import { storage } from '@shared/storage';
 
 type StepStatus = 'idle' | 'doing' | 'done' | 'error' | 'warn';
 
@@ -19,47 +19,91 @@ const props = withDefaults(
     summary?: string;
     /** 折叠态的快捷按钮（如「切换」「退出」） */
     actions?: QuickAction[];
-    /** 默认是否展开（仅作为初始值；之后由内部状态机 + 用户操作控制） */
+    /** 首次进入（storage 中无记录）时是否默认展开。默认 false：全部折叠。 */
     defaultExpanded?: boolean;
     /** 关闭自动折叠：true 时永远不会因 status 变化而自动折叠 */
     disableAutoCollapse?: boolean;
   }>(),
   {
     status: 'idle',
-    defaultExpanded: true,
+    defaultExpanded: false,
     disableAutoCollapse: false,
     actions: () => [],
   },
 );
 
-// 内部展开状态。规则：
-// - 初始：done → 折叠；其他 → 展开
-// - status 从 doing → done：自动折叠（除非用户手动展开过）
-// - status 从其他 → error：自动展开
-// - 用户点击 chevron：直接覆盖，并把「用户已操作」标志置 true，
-//   后续 status 变化不再自动改变（避免和用户意图打架）。
-const expanded = ref(initialExpanded());
-const userTouched = ref(false);
-
+// 展开状态持久化到 chrome.storage.local（panelStepExpanded）：
+// - 首次打开（storage 中无记录）：按 props.defaultExpanded 决定，默认全部折叠
+// - 之后每次打开都恢复上一次的展开/折叠状态
+// - 用户点击 chevron / 显式调用 expand() / status 自动状态机切换都会写回 storage
+//
+// 多个 CollapsibleStep 同时挂载、可能并发写入；用模块级共享 map +
+// 微节流（50ms 合并）写入，避免「读-改-写」竞态丢失其他面板的状态。
 const STEP_STATE_KEY = 'panelStepExpanded';
 
-onMounted(async () => {
-  const map = await sessionStore.getOne<Record<string, boolean>>(STEP_STATE_KEY);
-  if (map && props.step != null && String(props.step) in map) {
-    expanded.value = map[String(props.step)];
+const stepMap = new Map<string, boolean>();
+let stepMapLoaded = false;
+let stepMapLoadingPromise: Promise<void> | null = null;
+
+async function ensureStepMapLoaded(): Promise<void> {
+  if (stepMapLoaded) return;
+  if (!stepMapLoadingPromise) {
+    stepMapLoadingPromise = (async () => {
+      const raw = (await storage.getOne<Record<string, boolean>>(STEP_STATE_KEY)) || {};
+      for (const k in raw) stepMap.set(k, !!raw[k]);
+      stepMapLoaded = true;
+    })();
   }
+  await stepMapLoadingPromise;
+}
+
+let persistTimer: ReturnType<typeof setTimeout> | null = null;
+function schedulePersist(): void {
+  if (persistTimer != null) return;
+  persistTimer = setTimeout(() => {
+    persistTimer = null;
+    const obj: Record<string, boolean> = {};
+    stepMap.forEach((v, k) => (obj[k] = v));
+    storage.setOne(STEP_STATE_KEY, obj).catch(() => {});
+  }, 50);
+}
+
+const expanded = ref(initialExpanded());
+// 是否已完成「读 storage → 决定初始展开态」的初始化。
+// 在此之前任何来自 props.status 的自动展开/折叠规则都不允许触发，
+// 否则可能在首次 storage 读完成前被异步加载的 status 变化错误展开。
+const initialized = ref(false);
+// 是否仍允许 watch(props.status) 自动调整展开态。
+// 一旦：(a) storage 已有保存值，或 (b) 用户手动操作过 → 永久关闭，
+// 后续不再被自动状态机覆盖。
+const allowAutoStatusToggle = ref(true);
+// 是否允许写回 storage。在 onMounted 读完 storage 之前不允许写入，
+// 避免「初始默认值 false」被当作用户选择写回，把已保存的展开态抹掉。
+const allowPersist = ref(false);
+
+onMounted(async () => {
+  await ensureStepMapLoaded();
+  if (props.step != null) {
+    const k = String(props.step);
+    if (stepMap.has(k)) {
+      expanded.value = !!stepMap.get(k);
+      allowAutoStatusToggle.value = false;
+    }
+  }
+  initialized.value = true;
+  allowPersist.value = true;
 });
 
 watch(expanded, async (val) => {
-  const map = (await sessionStore.getOne<Record<string, boolean>>(STEP_STATE_KEY)) || {};
-  map[String(props.step)] = val;
-  await sessionStore.setOne(STEP_STATE_KEY, map);
+  if (!allowPersist.value) return;
+  if (props.step == null) return;
+  await ensureStepMapLoaded();
+  stepMap.set(String(props.step), val);
+  schedulePersist();
 });
 
 function initialExpanded(): boolean {
-  if (props.defaultExpanded === false) return false;
-  if (props.status === 'done') return false;
-  return true;
+  return !!props.defaultExpanded;
 }
 
 watch(
@@ -71,8 +115,9 @@ watch(
       expanded.value = true;
       return;
     }
-    // 用户已经手动操作过，则尊重用户意图，不再自动调整
-    if (userTouched.value) return;
+    // 初始化未完成 / 已有保存值 / 用户操作过 → 不允许自动状态机改写
+    if (!initialized.value) return;
+    if (!allowAutoStatusToggle.value) return;
     if (prev === 'doing' && next === 'done') {
       expanded.value = false;
       return;
@@ -86,13 +131,13 @@ watch(
 
 function toggle() {
   expanded.value = !expanded.value;
-  userTouched.value = true;
+  allowAutoStatusToggle.value = false;
 }
 
 /** 供父组件外部强制展开（如顶部状态条点击徽章跳转到对应配置项） */
 function expand() {
   expanded.value = true;
-  userTouched.value = true;
+  allowAutoStatusToggle.value = false;
 }
 
 defineExpose({ expand });

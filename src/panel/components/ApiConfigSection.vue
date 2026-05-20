@@ -142,6 +142,123 @@ function removeTimeRange(idx: number) {
   rangesState.list.splice(idx, 1);
 }
 
+// ---------- 快捷预设 ----------
+// 常用模板，一键替换整个 list；watch 会自动落盘。
+// "采 Xh / 歇 Yh" 类预设由 buildAlternatingRanges 程序化生成，不写死。
+
+interface TimeRangePreset {
+  id: string;
+  label: string;
+  desc: string;
+  ranges: AllowedTimeRange[];
+}
+
+function formatMinAsHmm(m: number): string {
+  const h = Math.floor(m / 60) % 24;
+  const min = m % 60;
+  return `${pad2(h)}:${pad2(min)}`;
+}
+
+/**
+ * 从 startMin 起，按「采 workMin 分 / 歇 restMin 分」交替排到 endMin。
+ * 每段单独不跨午夜，保证 HTML time picker 能正常显示 + background 判定一致。
+ */
+function buildAlternatingRanges(
+  workMin: number,
+  restMin: number,
+  startMin = 0,
+  endMin = 24 * 60,
+): AllowedTimeRange[] {
+  const out: AllowedTimeRange[] = [];
+  let t = startMin;
+  while (t < endMin) {
+    const e = Math.min(endMin, t + workMin);
+    if (e <= t) break;
+    out.push({ start: formatMinAsHmm(t), end: formatMinAsHmm(e) });
+    t = e + restMin;
+  }
+  return out;
+}
+
+const TIME_RANGE_PRESETS: TimeRangePreset[] = [
+  {
+    id: 'all',
+    label: '全天',
+    desc: '清空所有时间段 = 24h 不限制',
+    ranges: [],
+  },
+  {
+    id: 'daytime',
+    label: '白天 9-18',
+    desc: '工作时段：09:00 - 18:00',
+    ranges: [{ start: '09:00', end: '18:00' }],
+  },
+  {
+    id: 'avoid-lunch',
+    label: '避午休 10-21',
+    desc: '上午 10:00-13:00 + 下午 14:00-21:00',
+    ranges: [
+      { start: '10:00', end: '13:00' },
+      { start: '14:00', end: '21:00' },
+    ],
+  },
+  {
+    id: 'on1off1',
+    label: '采1h 歇1h',
+    desc: '00:00 起采 1 小时 / 歇 1 小时，共 12 段（反风控节奏）',
+    ranges: buildAlternatingRanges(60, 60),
+  },
+  {
+    id: 'on2off2',
+    label: '采2h 歇2h',
+    desc: '00:00 起采 2 小时 / 歇 2 小时，共 6 段（间隔更长）',
+    ranges: buildAlternatingRanges(120, 120),
+  },
+  {
+    id: 'on30off30',
+    label: '采30m 歇30m',
+    desc: '00:00 起采 30 分钟 / 歇 30 分钟，共 24 段（最密集）',
+    ranges: buildAlternatingRanges(30, 30),
+  },
+  {
+    id: 'night',
+    label: '夜班 22-06',
+    desc: '22:00 至次日 06:00（跨午夜单段）',
+    ranges: [{ start: '22:00', end: '06:00' }],
+  },
+];
+
+const presetSer = (rs: AllowedTimeRange[]): string => {
+  // 标准化：剔除未填完整 + 排序，再序列化；避免「顺序不同 / 留了空段」时无法匹配
+  const norm = rs
+    .filter((r) => r.start && r.end)
+    .slice()
+    .sort((a, b) => (a.start === b.start ? a.end.localeCompare(b.end) : a.start.localeCompare(b.start)));
+  try { return JSON.stringify(norm); } catch { return ''; }
+};
+
+/**
+ * 当前 list 是否完全匹配某个预设；用于按钮高亮。
+ * - 'all' 预设单独处理：valid 段为 0 都算匹配
+ */
+const activePresetId = computed<string | null>(() => {
+  if (!rangesState.ready) return null;
+  const valid = rangesState.list.filter((r) => r.start && r.end);
+  if (valid.length === 0) return 'all';
+  const cur = presetSer(rangesState.list);
+  for (const p of TIME_RANGE_PRESETS) {
+    if (p.id === 'all') continue;
+    if (presetSer(p.ranges) === cur) return p.id;
+  }
+  return null;
+});
+
+function applyPreset(p: TimeRangePreset) {
+  if (!rangesState.ready) return;
+  // 整体替换；watch(rangesState.list) + lastWrittenSer 已经处理落盘 + 去回响
+  rangesState.list = p.ranges.map((r) => ({ ...r }));
+}
+
 /**
  * 判定单段当前是否有效，用于在行末显示小提示：
  * - 任一端为空 → 'incomplete'：未填完整的段会被 isInAllowedTimeRanges 跳过
@@ -333,6 +450,24 @@ const shouldShowEffective = computed<boolean>(() => {
     </div>
 
     <label class="section-label">可执行时间范围（可添加多段，并集生效）</label>
+
+    <!-- 快捷预设：点一下整体替换时间段列表；激活的预设会高亮 -->
+    <div class="flex flex-wrap items-center gap-1.5 mb-1.5">
+      <span class="text-[11px] text-slate-400 shrink-0">快捷:</span>
+      <button
+        v-for="p in TIME_RANGE_PRESETS"
+        :key="p.id"
+        type="button"
+        class="text-[11px] px-2 py-0.5 rounded border transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+        :class="activePresetId === p.id
+          ? 'bg-brand/10 border-brand text-brand'
+          : 'bg-white border-slate-200 text-slate-600 hover:text-brand hover:border-brand hover:bg-brand/5'"
+        :title="p.desc"
+        :disabled="!rangesState.ready"
+        @click="applyPreset(p)"
+      >{{ p.label }}</button>
+    </div>
+
     <div class="flex flex-col gap-y-1.5 mb-1">
       <div
         v-for="(range, idx) in rangesState.list"

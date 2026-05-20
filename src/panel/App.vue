@@ -26,9 +26,14 @@ import NoteTable from './components/NoteTable.vue';
 import CreatorTable from './components/CreatorTable.vue';
 import CollapsibleStep from './components/CollapsibleStep.vue';
 import ImportExportDialog from './components/ImportExportDialog.vue';
+import NodeIdentitySection from './components/NodeIdentitySection.vue';
 import { accountStore } from './services/accountStore';
 import { keywordStore } from './services/keywordStore';
 import type { AccountCollectStats } from '@/types/xhs';
+import {
+  readCachedOutboundIp,
+  type OutboundIpInfo,
+} from '@shared/nodeIdentity';
 import {
   manualOrderedRunning,
   manualOrderedCancelRequested,
@@ -398,6 +403,70 @@ const nextWorkCard = computed(() => {
   };
 });
 
+// ---------- 节点身份摘要（折叠态显示用） ----------
+// 真正的取数 / UI 在 NodeIdentitySection.vue 内；这里仅订阅几个关键字段，
+// 折叠时也能一眼看到「别名 · IP · 已运行时长」。
+const nodeAlias = useStorageRef<string>(STORAGE_KEYS.nodeAlias, '');
+const nodeHostname = useStorageRef<string>(STORAGE_KEYS.nodeHostname, '');
+const nodeLanIpV4 = useStorageRef<string>(STORAGE_KEYS.nodeLanIpV4, '');
+const nodeStartupAt = useStorageRef<number>(STORAGE_KEYS.nodeStartupAt, 0);
+const outboundIpCache = useStorageRef<OutboundIpInfo | null>(
+  STORAGE_KEYS.outboundIpCache,
+  null,
+);
+// nodeId 仅展示用，挂载时读一次即可，不需要长连订阅
+const nodeIdShort = ref<string>('');
+onMounted(async () => {
+  try {
+    const cached = await readCachedOutboundIp();
+    if (cached) outboundIpCache.value = cached;
+  } catch {}
+  try {
+    const o = await chrome.storage.local.get([STORAGE_KEYS.nodeId]);
+    const v = o[STORAGE_KEYS.nodeId];
+    if (typeof v === 'string' && v) {
+      nodeIdShort.value = v.slice(0, 8);
+    }
+  } catch {}
+});
+
+const summaryNode = computed(() => {
+  void nowTick.value;
+  const parts: string[] = [];
+  // 1. 业务标签优先：alias / hostname / nodeId 短码
+  const alias = (nodeAlias.value || '').trim();
+  const hostname = (nodeHostname.value || '').trim();
+  if (alias) parts.push(alias);
+  else if (hostname) parts.push(hostname);
+  else if (nodeIdShort.value) parts.push(`#${nodeIdShort.value}`);
+  // 2. 网络标识：内网 IP 优先（群控里更有定位价值），其次出口 IP
+  const lan = (nodeLanIpV4.value || '').trim();
+  if (lan) {
+    parts.push(lan);
+  } else {
+    const out = outboundIpCache.value;
+    if (out?.ok && out.ip) parts.push(out.ip);
+  }
+  // 3. 已运行时长
+  if (nodeStartupAt.value > 0) {
+    const ms = Math.max(0, Date.now() - nodeStartupAt.value);
+    parts.push(formatDurationShort(ms));
+  }
+  return parts.length ? parts.join(' · ') : '未识别';
+});
+
+const nodeStepStatus = computed<'idle' | 'done' | 'warn'>(() => {
+  // 节点身份完整度：
+  // - 没 nodeId → idle
+  // - 有 nodeId 但没 alias/hostname、也没 lanIp → warn（群控信息不齐）
+  // - alias/hostname 任填其一 + lanIp 任填 → done
+  if (!nodeIdShort.value) return 'idle';
+  const hasLabel = !!(nodeAlias.value || '').trim() || !!(nodeHostname.value || '').trim();
+  const hasLan = !!(nodeLanIpV4.value || '').trim();
+  if (hasLabel && hasLan) return 'done';
+  return 'warn';
+});
+
 // 轻量 toast
 const toast = ref<{ msg: string; type: 'info' | 'error' } | null>(null);
 
@@ -676,12 +745,20 @@ function reloadExtension() {
     </Transition>
 
     <CollapsibleStep
+      step="·"
+      title="节点环境"
+      :status="nodeStepStatus"
+      :summary="summaryNode"
+    >
+      <NodeIdentitySection />
+    </CollapsibleStep>
+
+    <CollapsibleStep
       ref="apiConfigStepRef"
       step="0"
       title="配置"
       :status="apiStatus"
       :summary="apiSummary"
-      :default-expanded="apiStatus !== 'done'"
       data-step="0"
     >
       <ApiConfigSection />
