@@ -1,6 +1,11 @@
 // background 通用工具：tab 等待、状态广播、storage 读写、cookie 清理
 
-import { STORAGE_KEYS, MSG } from '@shared/constants';
+import {
+  STORAGE_KEYS,
+  MSG,
+  normalizeAllowedTimeRanges,
+  type AllowedTimeRange,
+} from '@shared/constants';
 import { storage, sessionStore } from '@shared/storage';
 import { getTodayDateStr } from '@shared/time';
 import {
@@ -175,7 +180,43 @@ export async function getRandomIntervalMs(): Promise<number> {
 
 // ---------- 时间窗口判定 ----------
 // 实现下沉到 @shared/time（panel UI 也要复用同一份）；这里仅 re-export 维持调用点不变。
-export { isInAllowedTimeRange } from '@shared/time';
+export { isInAllowedTimeRange, isInAllowedTimeRanges } from '@shared/time';
+
+/**
+ * 从 storage 中读取当前生效的「可执行时间区间」列表。
+ * - 新字段 allowedTimeRanges 存在（含空数组） → 直接采用；空数组表示「不限制」（与 UI 语义一致）
+ * - 新字段完全不存在 → 回退到旧字段 allowedTimeStart/End 组成的单段（首次升级兼容）
+ * - 旧字段也没有 → 默认 [{ start: '10:00', end: '21:00' }]（保持历史默认行为）
+ *
+ * 返回值仅用于判定，不写回 storage（迁移由 panel UI 完成）。
+ */
+export async function readAllowedTimeRanges(): Promise<AllowedTimeRange[]> {
+  const o = await storage.get([
+    STORAGE_KEYS.allowedTimeRanges,
+    STORAGE_KEYS.allowedTimeStart,
+    STORAGE_KEYS.allowedTimeEnd,
+  ]);
+  const newField = o[STORAGE_KEYS.allowedTimeRanges];
+  if (Array.isArray(newField)) {
+    // 关键：尊重用户「全部删除」=「不限制」的语义，空数组也直接返回，**不**回退到旧字段
+    return normalizeAllowedTimeRanges(newField);
+  }
+  const legacyStart = o[STORAGE_KEYS.allowedTimeStart];
+  const legacyEnd = o[STORAGE_KEYS.allowedTimeEnd];
+  if (typeof legacyStart === 'string' || typeof legacyEnd === 'string') {
+    return [{
+      start: typeof legacyStart === 'string' ? legacyStart : '10:00',
+      end: typeof legacyEnd === 'string' ? legacyEnd : '21:00',
+    }];
+  }
+  return [{ start: '10:00', end: '21:00' }];
+}
+
+/** 把多段区间渲染成形如「10:00-13:00 / 14:00-21:00」的简短中文文案，用于日志 */
+export function formatAllowedTimeRanges(ranges: ReadonlyArray<AllowedTimeRange>): string {
+  if (!ranges || ranges.length === 0) return '不限制';
+  return ranges.map((r) => `${r.start || ''}-${r.end || ''}`).join(' / ');
+}
 
 // ---------- 账号采集统计 ----------
 

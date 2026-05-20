@@ -8,10 +8,13 @@ import {
   SEARCH_TRIGGER_MODE_DEFAULT,
   SEARCH_TRIGGER_MODE_LABEL,
   SEARCH_TRIGGER_MODE_DESC,
+  ALLOWED_TIME_RANGES_DEFAULT,
+  normalizeAllowedTimeRanges,
   type SearchTriggerMode,
+  type AllowedTimeRange,
 } from '@shared/constants';
 import { storage } from '@shared/storage';
-import { getNextAllowedChangeSeconds } from '@shared/time';
+import { getNextAllowedChangeSecondsForRanges } from '@shared/time';
 import ApiConfigSection from './components/ApiConfigSection.vue';
 import AccountSection from './components/AccountSection.vue';
 import AccountActions from './components/AccountActions.vue';
@@ -23,9 +26,14 @@ import NoteTable from './components/NoteTable.vue';
 import CreatorTable from './components/CreatorTable.vue';
 import CollapsibleStep from './components/CollapsibleStep.vue';
 import ImportExportDialog from './components/ImportExportDialog.vue';
+import NodeIdentitySection from './components/NodeIdentitySection.vue';
 import { accountStore } from './services/accountStore';
 import { keywordStore } from './services/keywordStore';
 import type { AccountCollectStats } from '@/types/xhs';
+import {
+  readCachedOutboundIp,
+  type OutboundIpInfo,
+} from '@shared/nodeIdentity';
 import {
   manualOrderedRunning,
   manualOrderedCancelRequested,
@@ -76,8 +84,14 @@ const taskRunning = useStorageRef<boolean>(STORAGE_KEYS.autoTaskRunning, false);
 const taskStatus = useStorageRef<string>(STORAGE_KEYS.autoTaskStatus, '');
 const countdownRemainSec = useStorageRef<number>(STORAGE_KEYS.countdownRemainSec, 0);
 const autoTaskSessionStartAt = useStorageRef<number>(STORAGE_KEYS.autoTaskSessionStartAt, 0);
-const allowedTimeStart = useStorageRef<string>(STORAGE_KEYS.allowedTimeStart, '10:00');
-const allowedTimeEnd = useStorageRef<string>(STORAGE_KEYS.allowedTimeEnd, '21:00');
+const allowedTimeRanges = useStorageRef<AllowedTimeRange[]>(
+  STORAGE_KEYS.allowedTimeRanges,
+  ALLOWED_TIME_RANGES_DEFAULT,
+  { transform: (raw) => {
+    const arr = normalizeAllowedTimeRanges(raw);
+    return arr.length > 0 ? arr : ALLOWED_TIME_RANGES_DEFAULT.map((r) => ({ ...r }));
+  } },
+);
 const callbackDailyStats = useStorageRef<Record<string, { ok: number; fail: number }>>(
   STORAGE_KEYS.callbackDailyStats,
   {},
@@ -375,15 +389,82 @@ function formatHms(totalSec: number): string {
 
 const nextWorkCard = computed(() => {
   void nowTick.value;
-  const start = allowedTimeStart.value || '10:00';
-  const end = allowedTimeEnd.value || '21:00';
-  const r = getNextAllowedChangeSeconds(start, end);
+  const ranges = allowedTimeRanges.value || [];
+  const r = getNextAllowedChangeSecondsForRanges(ranges);
   if (r.inRange) return null;
+  // 多段：把每段 start-end 拼成 "10:00-13:00 / 14:00-21:00" 形式展示
+  const label = ranges
+    .map((x) => `${x.start || ''}-${x.end || ''}`)
+    .filter((x) => x !== '-')
+    .join(' / ');
   return {
-    start,
-    end,
+    rangesLabel: label,
     label: formatHms(Math.max(0, r.nextChangeSeconds)),
   };
+});
+
+// ---------- 节点身份摘要（折叠态显示用） ----------
+// 真正的取数 / UI 在 NodeIdentitySection.vue 内；这里仅订阅几个关键字段，
+// 折叠时也能一眼看到「别名 · IP · 已运行时长」。
+const nodeAlias = useStorageRef<string>(STORAGE_KEYS.nodeAlias, '');
+const nodeHostname = useStorageRef<string>(STORAGE_KEYS.nodeHostname, '');
+const nodeLanIpV4 = useStorageRef<string>(STORAGE_KEYS.nodeLanIpV4, '');
+const nodeStartupAt = useStorageRef<number>(STORAGE_KEYS.nodeStartupAt, 0);
+const outboundIpCache = useStorageRef<OutboundIpInfo | null>(
+  STORAGE_KEYS.outboundIpCache,
+  null,
+);
+// nodeId 仅展示用，挂载时读一次即可，不需要长连订阅
+const nodeIdShort = ref<string>('');
+onMounted(async () => {
+  try {
+    const cached = await readCachedOutboundIp();
+    if (cached) outboundIpCache.value = cached;
+  } catch {}
+  try {
+    const o = await chrome.storage.local.get([STORAGE_KEYS.nodeId]);
+    const v = o[STORAGE_KEYS.nodeId];
+    if (typeof v === 'string' && v) {
+      nodeIdShort.value = v.slice(0, 8);
+    }
+  } catch {}
+});
+
+const summaryNode = computed(() => {
+  void nowTick.value;
+  const parts: string[] = [];
+  // 1. 业务标签优先：alias / hostname / nodeId 短码
+  const alias = (nodeAlias.value || '').trim();
+  const hostname = (nodeHostname.value || '').trim();
+  if (alias) parts.push(alias);
+  else if (hostname) parts.push(hostname);
+  else if (nodeIdShort.value) parts.push(`#${nodeIdShort.value}`);
+  // 2. 网络标识：内网 IP 优先（群控里更有定位价值），其次出口 IP
+  const lan = (nodeLanIpV4.value || '').trim();
+  if (lan) {
+    parts.push(lan);
+  } else {
+    const out = outboundIpCache.value;
+    if (out?.ok && out.ip) parts.push(out.ip);
+  }
+  // 3. 已运行时长
+  if (nodeStartupAt.value > 0) {
+    const ms = Math.max(0, Date.now() - nodeStartupAt.value);
+    parts.push(formatDurationShort(ms));
+  }
+  return parts.length ? parts.join(' · ') : '未识别';
+});
+
+const nodeStepStatus = computed<'idle' | 'done' | 'warn'>(() => {
+  // 节点身份完整度：
+  // - 没 nodeId → idle
+  // - 有 nodeId 但没 alias/hostname、也没 lanIp → warn（群控信息不齐）
+  // - alias/hostname 任填其一 + lanIp 任填 → done
+  if (!nodeIdShort.value) return 'idle';
+  const hasLabel = !!(nodeAlias.value || '').trim() || !!(nodeHostname.value || '').trim();
+  const hasLan = !!(nodeLanIpV4.value || '').trim();
+  if (hasLabel && hasLan) return 'done';
+  return 'warn';
 });
 
 // 轻量 toast
@@ -598,7 +679,7 @@ function reloadExtension() {
     <div
       v-if="nextWorkCard"
       class="flex items-center gap-2 mb-3 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-[12px] text-amber-800"
-      :title="`允许执行时间窗口 ${nextWorkCard.start}-${nextWorkCard.end}`"
+      :title="`允许执行时间窗口 ${nextWorkCard.rangesLabel}`"
     >
       <svg
         xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24"
@@ -612,8 +693,8 @@ function reloadExtension() {
       <span class="text-amber-600/80 shrink-0">·</span>
       <span class="shrink-0">距开工</span>
       <span class="font-mono font-semibold text-amber-900">{{ nextWorkCard.label }}</span>
-      <span class="ml-auto text-amber-700/80 text-[11px] shrink-0 font-mono">
-        {{ nextWorkCard.start }}-{{ nextWorkCard.end }}
+      <span class="ml-auto text-amber-700/80 text-[11px] shrink-0 font-mono truncate max-w-[50%]">
+        {{ nextWorkCard.rangesLabel }}
       </span>
     </div>
 
@@ -664,12 +745,20 @@ function reloadExtension() {
     </Transition>
 
     <CollapsibleStep
+      step="·"
+      title="节点环境"
+      :status="nodeStepStatus"
+      :summary="summaryNode"
+    >
+      <NodeIdentitySection />
+    </CollapsibleStep>
+
+    <CollapsibleStep
       ref="apiConfigStepRef"
       step="0"
       title="配置"
       :status="apiStatus"
       :summary="apiSummary"
-      :default-expanded="apiStatus !== 'done'"
       data-step="0"
     >
       <ApiConfigSection />

@@ -18,12 +18,18 @@ import {
 import { pushLog, setStatus, executeInPageMain, waitForTabComplete, getLogHistory } from './utils';
 import { checkPageHasLoginDialog, checkXhsLoginUiPresent } from './injected';
 import { handleStatsOp } from './statsBroker';
+import { initNodeIdentityInBackground } from '@shared/nodeIdentity';
 import type { AccountItem } from '@/types/xhs';
 
 chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => {});
 
 // 允许 content script（ISOLATED world）访问 chrome.storage.session
 chrome.storage.session.setAccessLevel({ accessLevel: 'TRUSTED_AND_UNTRUSTED_CONTEXTS' }).catch(() => {});
+
+// 节点身份 / 环境信息（100 节点集中管控 · 第一类指标）：
+// 保证 nodeId / firstSeenAt 存在，并把浏览器启动时间（onStartup / onInstalled）落盘。
+// 必须放在顶层 SW 代码里：MV3 service worker 可能在长等待间被回收，重启时上面 listener 也要重新注册。
+initNodeIdentityInBackground();
 
 // ---------- 全局错误捕获 ----------
 // MV3 service worker 是 Module Worker：未捕获的 Promise 拒绝 / 同步异常如果不监听，

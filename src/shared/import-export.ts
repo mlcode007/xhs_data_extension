@@ -63,6 +63,7 @@ export const EXPORT_GROUPS: ExportGroup[] = [
       STORAGE_KEYS.autoLoginOnDialog,
       STORAGE_KEYS.allowedTimeStart,
       STORAGE_KEYS.allowedTimeEnd,
+      STORAGE_KEYS.allowedTimeRanges,
     ]
   },
   {
@@ -102,8 +103,9 @@ export const STORAGE_KEY_LABEL: Record<string, string> = {
   [STORAGE_KEYS.orderedExecuteDelayMaxSec]: '顺序执行延迟上限',
   [STORAGE_KEYS.searchTriggerMode]: '搜索触发方式',
   [STORAGE_KEYS.autoLoginOnDialog]: '弹窗自动登录',
-  [STORAGE_KEYS.allowedTimeStart]: '可执行开始时间',
-  [STORAGE_KEYS.allowedTimeEnd]: '可执行结束时间',
+  [STORAGE_KEYS.allowedTimeStart]: '可执行开始时间（旧版兼容）',
+  [STORAGE_KEYS.allowedTimeEnd]: '可执行结束时间（旧版兼容）',
+  [STORAGE_KEYS.allowedTimeRanges]: '可执行时间区间',
   [STORAGE_KEYS.accountCollectStats]: '账号采集统计',
   [STORAGE_KEYS.callbackDailyStats]: '回传日统计',
 };

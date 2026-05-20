@@ -1,7 +1,7 @@
 {
   "name": "xhs-data-extension",
   "private": true,
-  "version": "2.5.0",
+  "version": "2.5.2",
   "type": "module",
   "description": "小红书/红书 数据采集 Chrome 插件",
   "scripts": {

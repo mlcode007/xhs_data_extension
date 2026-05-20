@@ -10,10 +10,10 @@ import {
   isSearchTriggerMode,
   type SearchTriggerMode,
 } from '@shared/constants';
-import { storage, sessionStore } from '@shared/storage';
+import { storage, sessionStore, onLocalStorageChange } from '@shared/storage';
 import { fetchKeywordTask, getApiHost, isPlaceholderHost } from '@shared/api';
 import { mergeKeywordTaskResultIntoStorage } from '@shared/pluginKeywordsMerge';
-import { getTodayDateStr } from '@shared/time';
+import { getTodayDateStr, isInAllowedTimeRanges } from '@shared/time';
 import { getConfiguredExploreHomeUrl, isXhsLikeHost } from '@shared/url';
 import { runStorageGC, maybeRunDailyBusinessPrune } from '@shared/storage-gc';
 import { ensureAccountListHydrated } from '@shared/accountListFinalize';
@@ -31,7 +31,8 @@ import {
   findNextAvailableAccount,
   getAccountTodayCollectCount,
   executeInPageMain,
-  isInAllowedTimeRange,
+  readAllowedTimeRanges,
+  formatAllowedTimeRanges,
 } from './utils';
 import {
   isPublishTimeFilterVisible,
@@ -83,6 +84,26 @@ try {
     if (autoTaskState.workingTabId === tabId) {
       autoTaskState.workingTabId = null;
     }
+  });
+} catch {}
+
+// ---------- allowedTimeRanges 变更的「主动唤醒」信号 ----------
+// 用户在面板上加 / 删 / 编辑可执行时间段后，希望 background 几乎 0 延迟地感知。
+// 实现：等待循环里 Promise.race([sleep, allowedRangesChangedPromise])；
+// 这里在模块顶层注册一次 onChanged 监听 —— SW 重启会重新执行本模块、监听会被重新挂上，
+// 不需要担心 SW 回收后失效。
+let allowedRangesChangedResolver: (() => void) | null = null;
+function nextAllowedRangesChangedPromise(): Promise<void> {
+  return new Promise<void>((resolve) => {
+    // 同一时刻只保留最新一个 resolver；上一个被覆盖也 OK，反正不会有人 await 它
+    allowedRangesChangedResolver = resolve;
+  });
+}
+try {
+  onLocalStorageChange(STORAGE_KEYS.allowedTimeRanges, () => {
+    const r = allowedRangesChangedResolver;
+    allowedRangesChangedResolver = null;
+    if (r) r();
   });
 } catch {}
 
@@ -1043,15 +1064,16 @@ export async function startAutoTaskLoop(opts?: {
     }
 
     // ---------- 可执行时间范围检查（含 resume / alarm 唤醒：首轮必须与常规循环一致）----------
-    const timeConfig = await storage.get([STORAGE_KEYS.allowedTimeStart, STORAGE_KEYS.allowedTimeEnd]);
-    const timeStart = (timeConfig[STORAGE_KEYS.allowedTimeStart] as string) || '10:00';
-    const timeEnd = (timeConfig[STORAGE_KEYS.allowedTimeEnd] as string) || '21:00';
-    const { inRange, nextChangeMinutes } = isInAllowedTimeRange(timeStart, timeEnd);
+    // 多段窗口：例如 [10:00-13:00, 14:00-21:00]。任一段命中即视为「在窗口内」；
+    // 不在窗口内时，nextChangeMinutes 指向「下一个段的 start」。
+    const timeRanges = await readAllowedTimeRanges();
+    const rangesLabel = formatAllowedTimeRanges(timeRanges);
+    const { inRange, nextChangeMinutes } = isInAllowedTimeRanges(timeRanges);
     if (!inRange) {
       const waitMin = Math.max(nextChangeMinutes, 1);
-      const msg = `当前不在可执行时间（${timeStart}-${timeEnd}），${waitMin}分钟后重新检测`;
-      await setStatus(msg);
-      await pushLog(msg);
+      const firstMsg = `当前不在可执行时间（${rangesLabel}），${waitMin}分钟后重新检测`;
+      await setStatus(firstMsg);
+      await pushLog(firstMsg);
       await storage.setOne(STORAGE_KEYS.countdownRemainSec, 0).catch(() => {});
       // 页内倒计时与 isolation 同源：必须用「小段」秒数（每段≤60）与本次 sleep(slice) 对齐，
       // 不可用「距下次开窗还有 N 秒」一整段传给页面，否则会与后台提前检测到进窗脱节。
@@ -1059,22 +1081,47 @@ export async function startAutoTaskLoop(opts?: {
       const deadline = Date.now() + waitMin * 60 * 1000;
       // MV3 SW 在长等待中会被 Chrome 回收：必须用 alarm 在 deadline 前唤醒，
       // 否则在 0 点等空闲时段 SW 一旦消失，整个非工作时间等待会无声断流。
+      // 注意：alarm 周期必须封顶到 1 分钟，否则像 17:15-17:15 这种短窗口 + 漫长 waitMin（如 1005min）
+      // 会让 SW 被回收后死等到第二天才唤醒，期间用户改 ranges 完全没人理。
       // 注：clearResumeState / waitBetweenKeywords / runDailyBusinessDataPrune 都会
       // 通过同名 alarm 进行覆盖或清理，所以这里只需 create 一次即可。
+      const alarmDelayMin = Math.max(Math.min(waitMin, 1), 1 / 60);
       try {
         await chrome.alarms.create(ALARM_NAMES.autoTaskResume, {
-          delayInMinutes: Math.max(waitMin, 1 / 60),
+          delayInMinutes: alarmDelayMin,
         });
       } catch {}
+      // 上次写入的 status 文案 / ranges 序列化，用来跳过"没变化"的写入，减少 storage 噪声
+      let lastWaitMsg = firstMsg;
+      let lastRangesLabel = rangesLabel;
       while (Date.now() < deadline) {
         if (stale() || autoTaskState.abort) break;
-        const again = isInAllowedTimeRange(timeStart, timeEnd);
+        // 用户可能在等待期间编辑了区间配置，每次都重读最新值，避免按"过期 snapshot"等待
+        const againRanges = await readAllowedTimeRanges();
+        const again = isInAllowedTimeRanges(againRanges);
         if (again.inRange) break;
-        const slice = Math.min(60_000, Math.max(0, deadline - Date.now()));
+        // 每次重检都刷新 status：让用户能在面板看到 "剩余 X 分钟" 实时减少，
+        // 同时如果用户改了 ranges 文案，也能立即在状态条体现。
+        const remainMin = Math.max(1, again.nextChangeMinutes);
+        const curLabel = formatAllowedTimeRanges(againRanges);
+        const curMsg = `当前不在可执行时间（${curLabel}），${remainMin}分钟后重新检测`;
+        if (curMsg !== lastWaitMsg) {
+          await setStatus(curMsg).catch(() => {});
+          if (curLabel !== lastRangesLabel) {
+            // ranges 文案真的变了才写日志，避免每 5s 刷一条
+            await pushLog(`配置已更新：${curMsg}`).catch(() => {});
+          }
+          lastWaitMsg = curMsg;
+          lastRangesLabel = curLabel;
+        }
+        // 15s 一片：SW 活着时每 15s 主动重检一次；SW 被回收时靠 alarm 唤醒。
+        // 同时 race 上 allowedTimeRanges 的变化信号 —— 用户改配置后几乎 0 延迟感知，
+        // 因此 15s 仅作为「兜底节流频率」，不会拖慢配置变化的响应时间。
+        const slice = Math.min(15_000, Math.max(0, deadline - Date.now()));
         if (slice <= 0) break;
         const sliceSec = Math.max(1, Math.ceil(slice / 1000));
         countdown(true, '等待可执行时间 · 读秒检测', sliceSec);
-        await sleep(slice);
+        await Promise.race([sleep(slice), nextAllowedRangesChangedPromise()]);
       }
       countdown(false);
       await storage.setOne(STORAGE_KEYS.countdownRemainSec, 0).catch(() => {});
@@ -1087,8 +1134,8 @@ export async function startAutoTaskLoop(opts?: {
         await finishAll();
         return;
       }
-      // 刚进 10:00–21:00：把工作标签拉回配置站点（国内/国际）explore，再进入本轮任务
-      if (!stale() && isInAllowedTimeRange(timeStart, timeEnd).inRange) {
+      // 刚进可执行窗口：把工作标签拉回配置站点（国内/国际）explore，再进入本轮任务
+      if (!stale() && isInAllowedTimeRanges(await readAllowedTimeRanges()).inRange) {
         // 已经主动跳了首页，等价于完成了 alarm 唤醒所需的"重注脚本"动作，
         // 防止下面 iter 起始再 ping 一次又跳一次。
         alarmRevivePending = false;
@@ -1161,12 +1208,12 @@ export async function startAutoTaskLoop(opts?: {
       }
       // 每个关键词执行前检查是否仍在可执行时间范围，避免跨天时内层循环无感继续
       {
-        const tc = await storage.get([STORAGE_KEYS.allowedTimeStart, STORAGE_KEYS.allowedTimeEnd]);
-        const ts = (tc[STORAGE_KEYS.allowedTimeStart] as string) || '10:00';
-        const te = (tc[STORAGE_KEYS.allowedTimeEnd] as string) || '21:00';
-        const { inRange } = isInAllowedTimeRange(ts, te);
+        const ranges = await readAllowedTimeRanges();
+        const { inRange } = isInAllowedTimeRanges(ranges);
         if (!inRange) {
-          await pushLog(`当前不在可执行时间（${ts}-${te}），暂停本轮，等待下次时间窗口`);
+          await pushLog(
+            `当前不在可执行时间（${formatAllowedTimeRanges(ranges)}），暂停本轮，等待下次时间窗口`,
+          );
           countdown(false);
           await storage.setOne(STORAGE_KEYS.countdownRemainSec, 0).catch(() => {});
           break;

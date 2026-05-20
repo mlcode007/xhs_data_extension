@@ -54,6 +54,122 @@ export function parseTimeToMinutes(timeStr: string): number | null {
   return h * 60 + min;
 }
 
+const DAY_MIN = 24 * 60;
+const DAY_SEC = 24 * 3600;
+
+/**
+ * 把单个区间归一化为 [start, end) 闭开半开形式（分钟数）：
+ * - 同日：[s, e)
+ * - 跨午夜（s > e）：拆成 [s, 1440) 与 [0, e)
+ * - end === start：视为「就该分钟内可执行」= [s, s+1)，即 [HH:mm:00, HH:mm+1:00)。
+ *   这是用户在 picker 中选两次相同时间最自然的语义；
+ *   "全天可执行"语义请通过「删光所有段」表达。
+ *   边界：23:59-23:59 → [1439, 1440)，仍在当天范围内。
+ * - 解析失败：返回 []
+ */
+function expandRangeMin(start: string, end: string): Array<[number, number]> {
+  const s = parseTimeToMinutes(start);
+  const e = parseTimeToMinutes(end);
+  if (s === null || e === null) return [];
+  if (s === e) return [[s, Math.min(s + 1, DAY_MIN)]];
+  if (s < e) return [[s, e]];
+  return [[s, DAY_MIN], [0, e]];
+}
+
+/** 合并 / 排序 / 去重叠 ，得到不相交、按 start 升序的区间集 */
+function mergeRangesMin(ranges: Array<[number, number]>): Array<[number, number]> {
+  if (ranges.length === 0) return [];
+  const sorted = ranges.slice().sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  const out: Array<[number, number]> = [];
+  for (const [s, e] of sorted) {
+    const last = out[out.length - 1];
+    if (last && s <= last[1]) {
+      if (e > last[1]) last[1] = e;
+    } else {
+      out.push([s, e]);
+    }
+  }
+  return out;
+}
+
+/**
+ * 把多段配置归一化为「合并后、按 start 升序、互不重叠」的分钟区间集合。
+ * 任一区间字符串非法（含空串）→ 整段视为无效被丢弃。
+ * 全部丢弃后返回空数组，调用方按"不限制"处理。
+ */
+export function buildEffectiveRangesMin(
+  ranges: ReadonlyArray<{ start: string; end: string }>,
+): Array<[number, number]> {
+  const expanded: Array<[number, number]> = [];
+  for (const r of ranges) {
+    for (const seg of expandRangeMin(r.start, r.end)) expanded.push(seg);
+  }
+  return mergeRangesMin(expanded);
+}
+
+/**
+ * 多区间版「可执行时间」判定。
+ * - ranges 为空 / 全部非法 → 视为不限制：inRange=true，nextChangeMinutes=60（兜底刷新）
+ * - 否则取并集后判定 nowMin 是否落在其中
+ * @returns inRange + 距下一次「开窗或关窗」的分钟数（≥1）
+ */
+export function isInAllowedTimeRanges(
+  ranges: ReadonlyArray<{ start: string; end: string }>,
+): { inRange: boolean; nextChangeMinutes: number } {
+  const eff = buildEffectiveRangesMin(ranges);
+  if (eff.length === 0) return { inRange: true, nextChangeMinutes: 60 };
+
+  const now = new Date();
+  const nowMin = now.getHours() * 60 + now.getMinutes();
+
+  for (const [s, e] of eff) {
+    if (nowMin >= s && nowMin < e) {
+      // 落在某段内，下一次切换 = 该段 end
+      return { inRange: true, nextChangeMinutes: Math.max(1, e - nowMin) };
+    }
+  }
+  // 不在任何段内 → 找「最近一个未来的 start」
+  let nextStart = Infinity;
+  for (const [s] of eff) {
+    if (s > nowMin && s < nextStart) nextStart = s;
+  }
+  if (!isFinite(nextStart)) {
+    // 今天之内没有更晚的开始点 → 取明天第一个开始点
+    nextStart = DAY_MIN + eff[0][0];
+  }
+  return { inRange: false, nextChangeMinutes: Math.max(1, nextStart - nowMin) };
+}
+
+/**
+ * 多区间版「下次切换」秒级倒计时（用于 UI 按秒刷新展示）。
+ */
+export function getNextAllowedChangeSecondsForRanges(
+  ranges: ReadonlyArray<{ start: string; end: string }>,
+): { inRange: boolean; nextChangeSeconds: number } {
+  const eff = buildEffectiveRangesMin(ranges);
+  if (eff.length === 0) return { inRange: true, nextChangeSeconds: 3600 };
+
+  const now = new Date();
+  const nowSec = now.getHours() * 3600 + now.getMinutes() * 60 + now.getSeconds();
+
+  for (const [s, e] of eff) {
+    const startSec = s * 60;
+    const endSec = e * 60;
+    if (nowSec >= startSec && nowSec < endSec) {
+      return { inRange: true, nextChangeSeconds: Math.max(1, endSec - nowSec) };
+    }
+  }
+  let nextStartSec = Infinity;
+  for (const [s] of eff) {
+    const startSec = s * 60;
+    if (startSec > nowSec && startSec < nextStartSec) nextStartSec = startSec;
+  }
+  if (!isFinite(nextStartSec)) {
+    nextStartSec = DAY_SEC + eff[0][0] * 60;
+  }
+  return { inRange: false, nextChangeSeconds: Math.max(1, nextStartSec - nowSec) };
+}
+
 /**
  * 检查当前时间是否在允许执行的时间范围内。
  * - 同一天内：start <= end，如 10:00-21:00
